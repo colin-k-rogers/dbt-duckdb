@@ -221,7 +221,9 @@ def test_failure_points_at_the_logs_instead_of_dumping_them():
 
     message = str(excinfo.value)
     assert "status FAILED" in message
-    assert "MD_GET_FLIGHT_LOGS" in message
+    assert (
+        "https://app.motherduck.com/flights/11111111-2222-3333-4444-555555555555/runs/7" in message
+    )
     assert "ValueError: nope" not in message
     assert not cursor.sql_containing("MD_GET_FLIGHT_LOGS")
 

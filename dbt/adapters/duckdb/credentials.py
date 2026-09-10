@@ -193,8 +193,8 @@ class FlightConfig(dbtClassMixin):
     # error points at the log instead.
     log_lines: int = 0
 
-    # Where to read a run's logs, e.g. "https://.../{flight_id}/{run_number}".
-    # Defaults to a MD_GET_FLIGHT_LOGS query.
+    # Overrides the MotherDuck UI link to a run's logs; takes {flight_id} and
+    # {run_number}.
     log_url_template: Optional[str] = None
 
     # Requirements added to every Flight, on top of each model's `packages`.

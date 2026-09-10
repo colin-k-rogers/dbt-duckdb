@@ -38,6 +38,9 @@ MAX_REQUIREMENTS_BYTES = 20 * 1024
 # Flight names are shown in the MotherDuck UI; keep them bounded.
 MAX_FLIGHT_NAME_LENGTH = 120
 
+# Where a failed run's logs live, unless `flights.log_url_template` says otherwise.
+DEFAULT_LOG_URL_TEMPLATE = "https://app.motherduck.com/flights/{flight_id}/runs/{run_number}"
+
 # The remote counterpart of Environment.run_python_job(). dbt-core's codegen
 # supplies model()/dbtObj() and py_write_table supplies materialize(); the
 # runtime injects MOTHERDUCK_TOKEN, which duckdb.connect("md:") picks up.
@@ -370,12 +373,8 @@ class FlightRunner:
         return "\n".join(line for line in lines if line)
 
     def _log_location(self, flight_id: str, run_number: int) -> str:
-        if self._config.log_url_template:
-            return self._config.log_url_template.format(flight_id=flight_id, run_number=run_number)
-        return (
-            f"SELECT line FROM MD_GET_FLIGHT_LOGS(flight_id := '{flight_id}', "
-            f"run_number := {run_number}) ORDER BY line_number"
-        )
+        template = self._config.log_url_template or DEFAULT_LOG_URL_TEMPLATE
+        return template.format(flight_id=flight_id, run_number=run_number)
 
     def _log_tail(self, cursor, flight_id: str, run_number: int) -> str:
         try:

@@ -854,8 +854,8 @@ default:
 
 dbt keeps one Flight per model and updates it only when the model's code or requirements actually change — so each
 model gets its own run and version history in the MotherDuck UI. A failing run raises with the Flight name, run number
-and exit code, plus how to read that run's logs; set `log_lines` to inline that many lines of the log instead, and
-`log_url_template` (e.g. `https://.../{flight_id}/{run_number}`) to point at your MotherDuck UI.
+and exit code, plus a link to that run's logs in MotherDuck. Flight logs include the whole dependency install, so they
+are not dumped into dbt's output; set `log_lines` to inline that many lines of the log as well.
 
 **Flight names come from a macro you can override.** The default is the model's project, database, schema and
 identifier. Flight names are unique per MotherDuck user, so if two dbt targets share a database and schema — or you
