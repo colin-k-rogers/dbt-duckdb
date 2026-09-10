@@ -4,11 +4,12 @@ import pytest
 from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.duckdb.credentials import DuckDBCredentials, FlightConfig
+from dbt.adapters.duckdb.constants import FLIGHT_NAME_KEY
 from dbt.adapters.duckdb.environments.flights import (
     FlightRunner,
     build_requirements,
     build_source,
-    flight_name,
+    sanitize_flight_name,
 )
 from dbt.adapters.duckdb.environments.motherduck import MotherDuckEnvironment
 
@@ -59,25 +60,26 @@ class FakeCursor:
         return [sql for sql in self.executed if needle in sql]
 
 
-def test_flight_name_is_deterministic_and_qualified():
-    name = flight_name(parsed_model())
+def test_flight_name_comes_from_the_macro():
+    model = parsed_model()
+    model[FLIGHT_NAME_KEY] = "my-custom-flight"
+    assert FlightRunner(FlightConfig()).flight_name(model) == "my-custom-flight"
+
+
+def test_flight_name_falls_back_when_the_macro_did_not_run():
+    # The adapter resolves the macro; direct callers of the runner still get a name
+    name = FlightRunner(FlightConfig()).flight_name(parsed_model())
     assert name == "dbt-my_project-my_db-main-my_model"
-    assert name == flight_name(parsed_model())
 
 
-def test_flight_name_sanitizes_and_respects_prefix():
-    model = parsed_model()
-    model["schema"] = "dbt.dev schema"
-    assert flight_name(model, prefix="ci") == "ci-my_project-my_db-dbt_dev_schema-my_model"
+def test_flight_name_is_sanitized_and_bounded():
+    assert sanitize_flight_name("dbt.dev schema/model") == "dbt.dev_schema_model"
+    assert len(sanitize_flight_name("x" * 300)) == 120
 
 
-def test_flight_name_truncates_with_digest():
-    model = parsed_model()
-    model["alias"] = "x" * 300
-    name = flight_name(model)
-    assert len(name) <= 120
-    # The identifier tail survives, and the digest keeps truncation collision-free
-    assert name.endswith(flight_name(model)[-9:])
+def test_flight_name_rejects_an_empty_macro_result():
+    with pytest.raises(DbtRuntimeError, match="empty Flight name"):
+        sanitize_flight_name("///")
 
 
 def test_build_source_appends_entrypoint():
@@ -210,14 +212,36 @@ def test_submit_updates_a_changed_flight():
     assert not cursor.sql_containing("MD_CREATE_FLIGHT")
 
 
-def test_submit_raises_with_logs_when_the_run_fails():
+def test_failure_points_at_the_logs_instead_of_dumping_them():
+    # A Flight log includes the whole dependency install, so the default is a
+    # pointer rather than pasting it into dbt's output.
     cursor = _runner_cursor(status="FAILED")
     with pytest.raises(DbtRuntimeError) as excinfo:
         FlightRunner(FlightConfig()).submit(cursor, parsed_model(), COMPILED_CODE)
 
     message = str(excinfo.value)
     assert "status FAILED" in message
-    assert "ValueError: nope" in message
+    assert "MD_GET_FLIGHT_LOGS" in message
+    assert "ValueError: nope" not in message
+    assert not cursor.sql_containing("MD_GET_FLIGHT_LOGS")
+
+
+def test_failure_uses_the_configured_log_url():
+    cursor = _runner_cursor(status="FAILED")
+    config = FlightConfig(log_url_template="https://example.com/{flight_id}/runs/{run_number}")
+    with pytest.raises(DbtRuntimeError) as excinfo:
+        FlightRunner(config).submit(cursor, parsed_model(), COMPILED_CODE)
+
+    assert "https://example.com/11111111-2222-3333-4444-555555555555/runs/7" in str(excinfo.value)
+
+
+def test_failure_inlines_a_log_tail_when_asked():
+    cursor = _runner_cursor(status="FAILED")
+    with pytest.raises(DbtRuntimeError) as excinfo:
+        FlightRunner(FlightConfig(log_lines=20)).submit(cursor, parsed_model(), COMPILED_CODE)
+
+    assert "ValueError: nope" in str(excinfo.value)
+    assert '"limit" := 20' in cursor.sql_containing("MD_GET_FLIGHT_LOGS")[0]
 
 
 def test_submit_cancels_the_run_when_it_times_out():
@@ -375,3 +399,59 @@ def test_flights_block_parses_from_a_profile():
     assert creds.flights.access_token_name == "analytics-token"
     assert creds.flights.max_runtime_sec == 900
     assert creds.flights.requirements == ["pandas==2.2.3"]
+
+
+def test_duplicate_name_from_a_concurrent_run_updates_that_flight():
+    # Flight names are unique per MotherDuck user, so a create can lose a race
+    # with another dbt invocation that made the same Flight moments earlier.
+    cursor = _runner_cursor()
+    existing = [("11111111-2222-3333-4444-555555555555", "dbt-my_project-my_db-main-my_model")]
+
+    def create_then_conflict(*_):
+        raise DbtRuntimeError('Catalog Error: Flight with name "..." already exists')
+
+    cursor.responses["MD_CREATE_FLIGHT"] = create_then_conflict
+    cursor.responses["MD_LIST_FLIGHTS"] = existing
+
+    FlightRunner(FlightConfig()).submit(cursor, parsed_model(), COMPILED_CODE)
+
+    assert cursor.sql_containing("MD_UPDATE_FLIGHT")
+    assert cursor.sql_containing("MD_RUN_FLIGHT")
+
+
+def test_duplicate_name_owned_by_someone_else_is_explained():
+    # Only the owner can run a Flight, so a name taken by another user is a
+    # dead end -- point at the macro that renames ours.
+    cursor = _runner_cursor()
+
+    def conflict(*_):
+        raise DbtRuntimeError('Catalog Error: Flight with name "..." already exists')
+
+    cursor.responses["MD_CREATE_FLIGHT"] = conflict
+
+    with pytest.raises(DbtRuntimeError, match="duckdb__flight_name"):
+        FlightRunner(FlightConfig()).submit(cursor, parsed_model(), COMPILED_CODE)
+
+
+def test_access_token_name_is_kept_out_of_errors():
+    # DuckDB errors can echo the statement, which carries the token label
+    cursor = _runner_cursor()
+
+    def echo_sql(*_):
+        raise RuntimeError("Binder Error in: access_token_name := 'super-secret-token'")
+
+    cursor.responses["MD_CREATE_FLIGHT"] = echo_sql
+    config = FlightConfig(access_token_name="super-secret-token")
+
+    with pytest.raises(DbtRuntimeError) as excinfo:
+        FlightRunner(config).submit(cursor, parsed_model(), COMPILED_CODE)
+
+    assert "super-secret-token" not in str(excinfo.value)
+    assert "***" in str(excinfo.value)
+
+
+def test_flights_config_is_not_in_the_logged_connection_keys():
+    # dbt logs connection_info(); access_token_name names a MotherDuck token
+    creds = credentials(flights={"access_token_name": "analytics-token"})
+    assert "flights" not in creds._connection_keys()
+    assert all("token" not in str(value) for _, value in creds.connection_info())

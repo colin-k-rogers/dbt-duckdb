@@ -1,21 +1,15 @@
 """Run dbt Python models on MotherDuck Flights instead of in the dbt process.
 
-A Flight is a single-file Python program that MotherDuck runs in a container of
-its own. The code dbt-core generates for a Python model is already
-self-contained -- it needs only a DuckDB connection and a function that turns a
-relation name into a DataFrame -- so submitting a model to a Flight comes down
-to appending a ``main()`` that supplies those two things, and then driving the
-Flight lifecycle from the connection the adapter already holds.
+A Flight is a single-file Python program that MotherDuck runs in its own
+container. dbt-core's compiled Python model only needs a DuckDB connection and
+a function mapping a relation name to a DataFrame, so the Flight source is that
+compiled code plus a generated main() supplying both.
 
-The whole lifecycle is expressed as MD_*_FLIGHT SQL table functions, which are
-callable on any MotherDuck connection, so this adds no client library and no
-new network path. They are permitted in SaaS mode as well, which is what makes
-it possible to run Python models there at all: the model body executes in
-MotherDuck's container instead of on the dbt host, so SaaS mode's ban on local
-filesystem access is not something we have to work around.
+The lifecycle is expressed as MD_*_FLIGHT SQL functions, callable on any
+MotherDuck connection -- including one in SaaS mode, which is what lets Python
+models run there at all.
 """
 
-import hashlib
 import re
 import time
 from typing import Any
@@ -26,6 +20,7 @@ from typing import Optional
 import duckdb
 from dbt_common.exceptions import DbtRuntimeError
 
+from ..constants import FLIGHT_NAME_KEY
 from ..credentials import FlightConfig
 from ..utils import escape_sql_string
 from dbt.adapters.contracts.connection import AdapterResponse
@@ -33,24 +28,19 @@ from dbt.adapters.events.logging import AdapterLogger
 
 logger = AdapterLogger("DuckDB")
 
-# Statuses a run can end in; anything else means it is still going.
+# Anything else means the run is still going.
 TERMINAL_STATUSES = frozenset({"SUCCEEDED", "FAILED", "CANCELLED"})
 
-# MotherDuck caps Flight source at 200KB and requirements.txt at 20KB.
+# MotherDuck's limits on a Flight definition.
 MAX_SOURCE_BYTES = 200 * 1024
 MAX_REQUIREMENTS_BYTES = 20 * 1024
 
-# Flight names are used in the MotherDuck UI and in logs; keep them readable
-# and bounded, since we derive them from fully-qualified model names.
+# Flight names are shown in the MotherDuck UI; keep them bounded.
 MAX_FLIGHT_NAME_LENGTH = 120
 
-# Appended to the model's compiled code to produce the Flight entrypoint. This
-# is the remote counterpart of Environment.run_python_job(): dbt-core's codegen
-# supplies model()/dbtObj() and dbt-duckdb's py_write_table macro supplies
-# materialize(), so all this has to do is connect and wire them together.
-#
-# The Flight runtime injects MOTHERDUCK_TOKEN, which duckdb.connect("md:")
-# picks up on its own.
+# The remote counterpart of Environment.run_python_job(). dbt-core's codegen
+# supplies model()/dbtObj() and py_write_table supplies materialize(); the
+# runtime injects MOTHERDUCK_TOKEN, which duckdb.connect("md:") picks up.
 FLIGHT_ENTRYPOINT = """
 
 # --- dbt-duckdb flight entrypoint (generated) ---
@@ -58,10 +48,8 @@ __dbt_settings = {settings!r}
 
 
 def __dbt_apply_settings(cursor):
-    # The profile's `settings` are applied to every cursor the local
-    # environment hands a Python model (see Environment.initialize_cursor), so
-    # apply them here too; otherwise the same model produces different results
-    # depending on where it was submitted.
+    # Match Environment.initialize_cursor, so a model behaves the same wherever
+    # it was submitted.
     for statement in __dbt_settings:
         cursor.execute(statement)
 
@@ -78,8 +66,7 @@ def main():
     dbt = dbtObj(load_df_function)
     df = model(dbt, con)
     if isinstance(df, _duckdb.DuckDBPyRelation):
-        # A DuckDB relation may reference temporary tables that cannot cross
-        # cursor boundaries, so materialize it on the same cursor.
+        # A relation can reference temp tables that do not cross cursors.
         materialize(df, con)
     else:
         write_cursor = con.cursor()
@@ -95,8 +82,7 @@ if __name__ == "__main__":
 def _distribution_name(requirement: str) -> Optional[str]:
     """The distribution a requirements.txt line pins, normalized per PEP 503.
 
-    Returns None for lines that are not a plain requirement (pip options, URLs
-    without an egg name), which are passed through untouched.
+    None for pip options and anything else not attributable to a distribution.
     """
     match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[|[=<>!~;@]|$)", requirement)
     if not match:
@@ -104,40 +90,16 @@ def _distribution_name(requirement: str) -> Optional[str]:
     return re.sub(r"[-_.]+", "-", match.group(1)).lower()
 
 
-def _sanitize(value: str) -> str:
-    """Reduce a dbt name component to characters that are safe in a Flight name."""
-    return re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
-
-
-def flight_name(parsed_model: Dict[str, Any], prefix: str = "dbt") -> str:
-    """Build a stable Flight name for a model node.
-
-    The name has to be deterministic so that re-running a model updates its
-    Flight instead of creating another one, and distinct across targets so that
-    dev and prod runs of the same model do not fight over one Flight.
-    """
-    parts = [
-        parsed_model.get("package_name"),
-        parsed_model.get("database"),
-        parsed_model.get("schema"),
-        parsed_model.get("alias") or parsed_model.get("name"),
-    ]
-    name = "-".join([prefix] + [_sanitize(str(p)) for p in parts if p])
-    if len(name) > MAX_FLIGHT_NAME_LENGTH:
-        # Keep the tail (the model identifier is the informative part) and add a
-        # digest of the full name so truncation cannot collide.
-        digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
-        keep = MAX_FLIGHT_NAME_LENGTH - len(digest) - 1
-        name = f"{name[-keep:]}-{digest}"
-    return name
+def sanitize_flight_name(name: str) -> str:
+    """Make a name safe and bounded, preserving anything already reasonable."""
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_-")
+    if not name:
+        raise DbtRuntimeError("The flight_name macro returned an empty Flight name.")
+    return name[:MAX_FLIGHT_NAME_LENGTH]
 
 
 def settings_statements(settings: Optional[Dict[str, Any]]) -> List[str]:
-    """Render the profile's `settings` as SET statements for the Flight.
-
-    Mirrors Environment.initialize_cursor: values go in as strings and DuckDB
-    casts them to the setting's type.
-    """
+    """The profile's `settings` as SET statements, as initialize_cursor does."""
     return [f"SET {key} = '{escape_sql_string(value)}'" for key, value in (settings or {}).items()]
 
 
@@ -148,10 +110,9 @@ def build_source(compiled_code: str, settings: Optional[Dict[str, Any]] = None) 
     size = len(source.encode("utf-8"))
     if size > MAX_SOURCE_BYTES:
         raise DbtRuntimeError(
-            f"Python model is too large to run as a MotherDuck Flight: "
-            f"{size} bytes exceeds the {MAX_SOURCE_BYTES} byte limit. "
-            "Move the bulk of the code into a package listed in the model's "
-            "`packages` config."
+            f"Python model is too large to run as a MotherDuck Flight: {size} bytes "
+            f"exceeds the {MAX_SOURCE_BYTES} byte limit. Move the bulk of the code "
+            "into a package listed in the model's `packages` config."
         )
     return source
 
@@ -159,21 +120,15 @@ def build_source(compiled_code: str, settings: Optional[Dict[str, Any]] = None) 
 def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> str:
     """Assemble requirements.txt for the Flight.
 
-    A Flight installs its dependencies before main() runs and has no way to
-    install more later, so everything the model imports has to be declared up
-    front. dbt's `packages` model config is exactly that list -- it is inert in
-    the local environment, where the model runs in dbt's own interpreter, but
-    it is load-bearing here.
+    A Flight installs dependencies before main() runs and cannot install more
+    later, so dbt's `packages` model config -- inert locally -- is load-bearing
+    here. Later sources win per distribution, so `packages` beats
+    `flights.requirements` beats the default duckdb pin; two pins for one
+    distribution would just fail the install.
+
+    duckdb defaults to the local client's version, which MotherDuck accepts;
+    an unpinned install can pick up a release it rejects at connect time.
     """
-    # Pin duckdb to whatever the local client uses. That version is known to be
-    # accepted by MotherDuck (we are talking to it right now), whereas an
-    # unpinned install can pick up a newer PyPI release that MotherDuck
-    # rejects at connect time.
-    #
-    # Later sources override earlier ones for the same distribution, so a
-    # model's own `packages` beat the profile-wide `flights.requirements`,
-    # which in turn beat the default duckdb pin. Emitting both would leave the
-    # installer to fail on two conflicting pins for one distribution.
     packages: List[str] = [f"duckdb=={config.duckdb_version or duckdb.__version__}"]
     packages.extend(config.requirements or [])
     packages.extend((parsed_model.get("config") or {}).get("packages") or [])
@@ -186,8 +141,6 @@ def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> st
             continue
         name = _distribution_name(entry)
         if name is None:
-            # pip options (-r, --index-url, ...) and anything else we cannot
-            # attribute to a distribution: keep in order, do not deduplicate.
             passthrough.append(entry)
         else:
             resolved[name] = entry
@@ -196,8 +149,8 @@ def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> st
     size = len(requirements.encode("utf-8"))
     if size > MAX_REQUIREMENTS_BYTES:
         raise DbtRuntimeError(
-            f"Python model requirements are too large for a MotherDuck Flight: "
-            f"{size} bytes exceeds the {MAX_REQUIREMENTS_BYTES} byte limit."
+            f"Python model requirements are too large for a MotherDuck Flight: {size} "
+            f"bytes exceeds the {MAX_REQUIREMENTS_BYTES} byte limit."
         )
     return requirements
 
@@ -205,20 +158,18 @@ def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> st
 class FlightRunner:
     """Drives the Flight lifecycle for Python model submission.
 
-    One Flight is kept per model node, so each model gets its own run history
-    and source-version history in the MotherDuck UI, which is where you go when
-    a model fails.
+    One Flight per model node, so each keeps its own run and version history in
+    the MotherDuck UI.
     """
 
     def __init__(self, config: FlightConfig, settings: Optional[Dict[str, Any]] = None):
         self._config = config
         self._settings = settings
-        # Flight name -> id, so repeat models in one dbt invocation skip the
-        # lookup. Ids are stable for a Flight's lifetime.
+        # Flight name -> id, so later models in one dbt run skip the lookup.
         self._flight_ids: Dict[str, str] = {}
 
     def submit(self, cursor, parsed_model: Dict[str, Any], compiled_code: str) -> AdapterResponse:
-        name = flight_name(parsed_model, self._config.name_prefix)
+        name = self.flight_name(parsed_model)
         source = build_source(compiled_code, self._settings)
         requirements = build_requirements(parsed_model, self._config)
 
@@ -229,78 +180,113 @@ class FlightRunner:
         status, exit_code = self._await_run(cursor, flight_id, run_number, name)
         if status != "SUCCEEDED":
             raise DbtRuntimeError(
-                f"Python model failed on MotherDuck Flight '{name}' "
-                f"(run {run_number}, status {status}, exit code {exit_code}):\n"
-                + self._run_logs(cursor, flight_id, run_number)
+                f"Python model failed on MotherDuck Flight '{name}' (run {run_number}, "
+                f"status {status}, exit code {exit_code}).\n"
+                + self._log_pointer(cursor, flight_id, run_number)
             )
         return AdapterResponse(_message="OK")
+
+    def flight_name(self, parsed_model: Dict[str, Any]) -> str:
+        """The name from the flight_name macro, or a fallback when unresolved."""
+        name = parsed_model.get(FLIGHT_NAME_KEY)
+        if not name:
+            # The macro is resolved by the adapter; fall back when a caller
+            # invokes the runner directly.
+            parts = [
+                parsed_model.get("package_name"),
+                parsed_model.get("database"),
+                parsed_model.get("schema"),
+                parsed_model.get("alias") or parsed_model.get("name"),
+            ]
+            name = "-".join(["dbt"] + [str(part) for part in parts if part])
+        return sanitize_flight_name(str(name))
 
     # -- lifecycle steps ---------------------------------------------------
 
     def _upsert_flight(self, cursor, name: str, source: str, requirements: str) -> str:
-        """Create the Flight, or update it when its code has changed.
+        """Create the Flight, or update it when its code changed.
 
-        Every content change creates a new immutable Flight version, so compare
-        against the current version first: an unchanged model should not push a
-        new version on every dbt run.
+        Every content change mints a new immutable version, so check first
+        rather than versioning on every dbt run.
         """
         flight_id = self._find_flight(cursor, name)
         if flight_id is None:
-            row = self._query_one(
-                cursor,
-                "SELECT flight_id FROM MD_CREATE_FLIGHT("
-                f"name := '{escape_sql_string(name)}', "
-                f"source_code := '{escape_sql_string(source)}', "
-                f"requirements_txt := '{escape_sql_string(requirements)}'"
-                f"{self._optional_create_args()})",
-            )
-            flight_id = str(row[0])
-            self._flight_ids[name] = flight_id
-            logger.debug(f"Created MotherDuck Flight {name} ({flight_id})")
-            return flight_id
+            return self._create_flight(cursor, name, source, requirements)
 
         if self._is_current(cursor, flight_id, source, requirements):
             logger.debug(f"MotherDuck Flight {name} is up to date; reusing it")
             return flight_id
 
-        self._query_one(
+        self._execute(
             cursor,
             "SELECT flight_id FROM MD_UPDATE_FLIGHT("
             f"flight_id := '{flight_id}', "
             f"source_code := '{escape_sql_string(source)}', "
             f"requirements_txt := '{escape_sql_string(requirements)}'"
-            f"{self._optional_create_args()})",
+            f"{self._optional_args()})",
         )
         logger.debug(f"Updated MotherDuck Flight {name} ({flight_id})")
         return flight_id
 
-    def _optional_create_args(self) -> str:
+    def _create_flight(self, cursor, name: str, source: str, requirements: str) -> str:
+        sql = (
+            "SELECT flight_id FROM MD_CREATE_FLIGHT("
+            f"name := '{escape_sql_string(name)}', "
+            f"source_code := '{escape_sql_string(source)}', "
+            f"requirements_txt := '{escape_sql_string(requirements)}'"
+            f"{self._optional_args()})"
+        )
+        try:
+            row = self._execute(cursor, sql).fetchone()
+        except DbtRuntimeError as err:
+            if "already exists" not in str(err):
+                raise
+            # Either a concurrent dbt run created it between our lookup and
+            # this call, or another MotherDuck user owns the name: Flight names
+            # are unique per user, and only the owner can run one.
+            self._flight_ids.pop(name, None)
+            flight_id = self._find_flight(cursor, name)
+            if flight_id is None:
+                raise DbtRuntimeError(
+                    f"A MotherDuck Flight named '{name}' already exists but is not yours, "
+                    "so this model cannot run on it. Override the `duckdb__flight_name` "
+                    "macro to give this project's Flights a distinct name."
+                ) from err
+            return self._upsert_flight(cursor, name, source, requirements)
+
+        flight_id = str(row[0])
+        self._flight_ids[name] = flight_id
+        logger.debug(f"Created MotherDuck Flight {name} ({flight_id})")
+        return flight_id
+
+    def _optional_args(self) -> str:
         args = ""
         if self._config.access_token_name:
-            token = escape_sql_string(self._config.access_token_name)
-            args += f", access_token_name := '{token}'"
+            args += f", access_token_name := '{escape_sql_string(self._config.access_token_name)}'"
         if self._config.max_runtime_sec is not None:
             args += f", max_runtime_sec := {int(self._config.max_runtime_sec)}"
         return args
 
     def _find_flight(self, cursor, name: str) -> Optional[str]:
+        """Resolve a Flight id by name, among the Flights we own.
+
+        Only the owner can run a Flight, so another user's is of no use to us.
+        """
         if name in self._flight_ids:
             return self._flight_ids[name]
 
-        # MD_LIST_FLIGHTS pages, and an account can hold many Flights, so walk
-        # until we find the name or run out. `limit`/`offset` are reserved
-        # words and have to be quoted as named arguments.
+        # `limit`/`offset` are reserved words and need quoting as named args.
         page, offset = 200, 0
         while True:
-            rows = self._query_all(
+            rows = self._execute(
                 cursor,
                 "SELECT flight_id, flight_name FROM MD_LIST_FLIGHTS("
                 f'"limit" := {page}, "offset" := {offset}, owner_only := true)',
-            )
+            ).fetchall()
             if not rows:
                 return None
-            for flight_id, flight_name_ in rows:
-                self._flight_ids[flight_name_] = str(flight_id)
+            for flight_id, flight_name in rows:
+                self._flight_ids[flight_name] = str(flight_id)
             if name in self._flight_ids:
                 return self._flight_ids[name]
             if len(rows) < page:
@@ -308,55 +294,40 @@ class FlightRunner:
             offset += page
 
     def _is_current(self, cursor, flight_id: str, source: str, requirements: str) -> bool:
-        """Has this Flight already got exactly this code and requirements?
-
-        Every content change mints a new immutable Flight version, so checking
-        first keeps an unchanged model from adding a version on each dbt run.
-        The current version number has to be fetched separately: MotherDuck's
-        table functions reject subqueries in their arguments.
-        """
-        current = self._query_one(
+        # Two queries: MotherDuck's table functions reject subqueries in args.
+        current = self._execute(
             cursor, f"SELECT current_version FROM MD_GET_FLIGHT(flight_id := '{flight_id}')"
-        )
+        ).fetchone()
         if current is None or current[0] is None:
             return False
-        row = self._query_one(
+        row = self._execute(
             cursor,
             "SELECT source_code, requirements_txt FROM MD_GET_FLIGHT_VERSION("
             f"flight_id := '{flight_id}', version_number := {int(current[0])})",
-        )
-        if row is None:
-            return False
-        return row[0] == source and row[1] == requirements
+        ).fetchone()
+        return bool(row) and row[0] == source and row[1] == requirements
 
     def _start_run(self, cursor, flight_id: str) -> int:
-        row = self._query_one(
+        row = self._execute(
             cursor, f"SELECT run_number FROM MD_RUN_FLIGHT(flight_id := '{flight_id}')"
-        )
+        ).fetchone()
         return int(row[0])
 
     def _await_run(self, cursor, flight_id: str, run_number: int, name: str):
-        """Poll until the run reaches a terminal status.
-
-        Runs are asynchronous: a successful trigger only means the run was
-        accepted, so nothing downstream may assume the model is built until the
-        status says SUCCEEDED.
-        """
+        """Poll until the run is terminal; a trigger only means it was accepted."""
         deadline = time.monotonic() + self._config.timeout_sec
         while True:
-            row = self._query_one(
+            row = self._execute(
                 cursor,
                 "SELECT status, exit_code FROM MD_GET_FLIGHT_RUN("
                 f"flight_id := '{flight_id}', run_number := {run_number})",
-            )
+            ).fetchone()
             status = str(row[0])
             if status in TERMINAL_STATUSES:
                 return status, row[1]
             if time.monotonic() > deadline:
-                # Cancel rather than walk away: an abandoned run would keep
-                # going and commit the model table well after dbt reported the
-                # node as failed, and a retry would race a second run writing
-                # the same relation.
+                # Cancel rather than walk away: an abandoned run would commit
+                # the model table after dbt had already failed the node.
                 cancelled = self._cancel_run(cursor, flight_id, run_number)
                 raise DbtRuntimeError(
                     f"Timed out after {self._config.timeout_sec}s waiting for MotherDuck "
@@ -364,16 +335,16 @@ class FlightRunner:
                     + (
                         "The run was cancelled. "
                         if cancelled
-                        else "The run could not be cancelled and may still be going; "
-                        "check it in MotherDuck. "
+                        else "The run could not be cancelled and may still be going. "
                     )
-                    + "Raise `flights.timeout_sec` if the model needs longer."
+                    + "Raise `flights.timeout_sec` if the model needs longer.\n"
+                    + self._log_pointer(cursor, flight_id, run_number)
                 )
             time.sleep(self._config.poll_interval_sec)
 
     def _cancel_run(self, cursor, flight_id: str, run_number: int) -> bool:
         try:
-            self._query_one(
+            self._execute(
                 cursor,
                 "SELECT * FROM MD_CANCEL_FLIGHT_RUN("
                 f"flight_id := '{flight_id}', run_number := {run_number})",
@@ -381,28 +352,58 @@ class FlightRunner:
             return True
         except Exception as err:
             # Losing the race against a run that just finished is normal, and a
-            # failed cancel must not mask the timeout we are reporting.
+            # failed cancel must not mask the timeout being reported.
             logger.debug(f"Could not cancel flight run {run_number}: {err}")
             return False
 
-    def _run_logs(self, cursor, flight_id: str, run_number: int) -> str:
-        """Fetch the tail of a run's logs, for attaching to a failure."""
+    # -- diagnostics -------------------------------------------------------
+
+    def _log_pointer(self, cursor, flight_id: str, run_number: int) -> str:
+        """Where to read the run's logs, plus a tail if `log_lines` asks for one.
+
+        A Flight log includes the whole dependency install, so it is not dumped
+        into dbt's output by default.
+        """
+        lines = [f"Logs: {self._log_location(flight_id, run_number)}"]
+        if self._config.log_lines:
+            lines.append(self._log_tail(cursor, flight_id, run_number))
+        return "\n".join(line for line in lines if line)
+
+    def _log_location(self, flight_id: str, run_number: int) -> str:
+        if self._config.log_url_template:
+            return self._config.log_url_template.format(flight_id=flight_id, run_number=run_number)
+        return (
+            f"SELECT line FROM MD_GET_FLIGHT_LOGS(flight_id := '{flight_id}', "
+            f"run_number := {run_number}) ORDER BY line_number"
+        )
+
+    def _log_tail(self, cursor, flight_id: str, run_number: int) -> str:
         try:
-            rows = self._query_all(
+            rows = self._execute(
                 cursor,
                 "SELECT line FROM MD_GET_FLIGHT_LOGS("
                 f"flight_id := '{flight_id}', run_number := {run_number}, "
                 f'"limit" := {self._config.log_lines}, "order" := \'desc\') '
                 "ORDER BY line_number",
-            )
+            ).fetchall()
         except Exception as err:  # pragma: no cover - diagnostics only
             return f"(could not read flight logs: {err})"
         return "\n".join(str(row[0]) for row in rows)
 
-    # -- cursor helpers ----------------------------------------------------
+    # -- cursor helper -----------------------------------------------------
 
-    def _query_all(self, cursor, sql: str) -> List[Any]:
-        return cursor.execute(sql).fetchall()
+    def _execute(self, cursor, sql: str):
+        """Run a statement, keeping the access token label out of any error.
 
-    def _query_one(self, cursor, sql: str) -> Any:
-        return cursor.execute(sql).fetchone()
+        DuckDB errors can echo the statement, and these carry that label.
+        """
+        try:
+            return cursor.execute(sql)
+        except Exception as err:
+            raise DbtRuntimeError(self._redact(str(err))) from None
+
+    def _redact(self, message: str) -> str:
+        token = self._config.access_token_name
+        if token:
+            message = message.replace(token, "***")
+        return message

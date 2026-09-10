@@ -7,6 +7,9 @@ from typing import Set
 from dbt_common.exceptions import DbtRuntimeError
 
 from .. import credentials
+from ..constants import FLIGHT_SUBMISSION
+from ..constants import LOCAL_SUBMISSION
+from ..constants import SUBMISSION_METHODS
 from ..credentials import FlightConfig
 from .flights import FlightRunner
 from .local import DuckDBConnectionWrapper
@@ -17,10 +20,6 @@ from dbt.adapters.contracts.connection import AdapterResponse
 MOTHERDUCK_SAAS_MODE_QUERY = """
 SELECT value FROM duckdb_settings() WHERE name = 'motherduck_saas_mode'
 """
-
-LOCAL_SUBMISSION = "local"
-FLIGHT_SUBMISSION = "flight"
-SUBMISSION_METHODS = (LOCAL_SUBMISSION, FLIGHT_SUBMISSION)
 
 SAAS_MODE_ERROR = (
     "Python models are disabled when MotherDuck SaaS Mode is on. Set "
@@ -49,12 +48,7 @@ class MotherDuckEnvironment(LocalEnvironment):
         return False
 
     def submission_method(self, parsed_model: Dict[str, Any]) -> str:
-        """Decide where a Python model's body runs.
-
-        The per-model `submission_method` config wins, matching how other
-        adapters let a single model opt into remote execution; the profile's
-        `flights.enabled_by_default` sets the default for the project.
-        """
+        """Where a Python model's body runs; the model config beats the profile."""
         config = parsed_model.get("config") or {}
         method = config.get("submission_method")
         if method is None:
@@ -73,11 +67,9 @@ class MotherDuckEnvironment(LocalEnvironment):
     def flight_databases(self) -> Set[str]:
         """Database names that resolve both locally and inside a Flight.
 
-        A Flight connects with a fresh `md:` handle, so it can only see
-        MotherDuck databases, and only under their real MotherDuck names. An
-        attachment given a local alias is therefore unusable remotely even
-        though it points at MotherDuck: relations rendered with the alias would
-        not resolve in the Flight.
+        A Flight's fresh `md:` handle only knows MotherDuck databases, under
+        their real names -- so an aliased attachment is unusable remotely even
+        though it points at MotherDuck.
         """
         names: Set[str] = set()
         if self.creds.is_motherduck_database:
@@ -91,9 +83,8 @@ class MotherDuckEnvironment(LocalEnvironment):
     def validate_flight_target(self, parsed_model: Dict[str, Any]) -> None:
         """Reject models a Flight could not build, before paying for a run.
 
-        MotherDuckEnvironment is also selected when MotherDuck is merely
-        attached to a local database, in which case a model can target a
-        catalog that exists only in the dbt process.
+        This environment is also used when MotherDuck is merely attached to a
+        local database, where a model can target a dbt-process-only catalog.
         """
         databases = self.flight_databases()
         database = parsed_model.get("database")
@@ -114,8 +105,8 @@ class MotherDuckEnvironment(LocalEnvironment):
         )
 
     def flight_runner(self) -> FlightRunner:
-        # dbt submits models from several threads; without the lock each could
-        # build its own runner and lose the others' flight-id cache.
+        # Without the lock, concurrent dbt threads each build a runner and lose
+        # the others' flight-id cache.
         with self._flight_lock:
             if self._flight_runner is None:
                 self._flight_runner = FlightRunner(
@@ -125,8 +116,7 @@ class MotherDuckEnvironment(LocalEnvironment):
 
     def submit_python_job(self, handle, parsed_model: dict, compiled_code: str) -> AdapterResponse:
         if self.submission_method(parsed_model) == FLIGHT_SUBMISSION:
-            # The model body runs in MotherDuck's container rather than here,
-            # so SaaS mode has nothing to object to.
+            # Runs in MotherDuck's container, so SaaS mode has no objection.
             self.validate_flight_target(parsed_model)
             return self.flight_runner().submit(handle.cursor(), parsed_model, compiled_code)
 

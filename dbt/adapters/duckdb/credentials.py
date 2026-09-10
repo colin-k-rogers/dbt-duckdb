@@ -165,46 +165,44 @@ class Extension(dbtClassMixin):
 class FlightConfig(dbtClassMixin):
     """Settings for running Python models on MotherDuck Flights.
 
-    Only used when a Python model is submitted with `submission_method: flight`
-    (or when `enabled_by_default` is set); the local environment ignores this.
+    Only consulted for models submitted with `submission_method: flight`.
     """
 
-    # Submit Python models to Flights without setting `submission_method` on
-    # each model. Individual models can still opt back out with
+    # Submit every Python model to a Flight. Models can opt back out with
     # `submission_method: local`.
     enabled_by_default: bool = False
 
-    # The label of the MotherDuck access token the Flight uses at runtime; its
-    # scope must cover every database the model reads or writes. The Flight
-    # runtime injects this as MOTHERDUCK_TOKEN, which is a reserved variable,
-    # so the token from `path`/`config_options` cannot be forwarded instead.
-    # Defaults to MotherDuck's built-in Flights token.
+    # Label of the MotherDuck access token the Flight uses at runtime; its
+    # scope must cover every database the model touches. The runtime injects
+    # it as MOTHERDUCK_TOKEN, a reserved variable, so the token from
+    # `path`/`config_options` cannot be forwarded instead. Defaults to
+    # MotherDuck's built-in Flights token.
     access_token_name: Optional[str] = None
 
-    # Per-run timeout enforced by MotherDuck, in seconds; 0 means no timeout
-    # and None uses the plan default.
+    # Per-run timeout enforced by MotherDuck; 0 means none, None the plan default.
     max_runtime_sec: Optional[int] = None
 
-    # How long dbt waits for a run to reach a terminal status before giving up
-    # on it (the run itself is not cancelled).
+    # How long dbt waits for a run before cancelling it.
     timeout_sec: int = 3600
 
     # How often to poll a running Flight.
     poll_interval_sec: float = 2.0
 
-    # How many lines of a failed run's log to include in the dbt error.
-    log_lines: int = 50
+    # Lines of a failed run's log to inline in the dbt error. A Flight log
+    # includes the whole dependency install, so this defaults to off and the
+    # error points at the log instead.
+    log_lines: int = 0
 
-    # Requirements added to every generated Flight, on top of each model's
-    # `packages` config.
+    # Where to read a run's logs, e.g. "https://.../{flight_id}/{run_number}".
+    # Defaults to a MD_GET_FLIGHT_LOGS query.
+    log_url_template: Optional[str] = None
+
+    # Requirements added to every Flight, on top of each model's `packages`.
     requirements: Optional[List[str]] = None
 
-    # Version to pin `duckdb` to inside the Flight; defaults to the version of
-    # the local duckdb client, which MotherDuck is known to accept.
+    # Version to pin `duckdb` to inside the Flight; defaults to the local
+    # client's version, which MotherDuck is known to accept.
     duckdb_version: Optional[str] = None
-
-    # Prefix for generated Flight names.
-    name_prefix: str = "dbt"
 
 
 @dataclass
@@ -280,7 +278,9 @@ class DuckDBCredentials(Credentials):
     retries: Optional[Retries] = None
 
     # Settings for running Python models on MotherDuck Flights instead of in
-    # the local dbt process; see the FlightConfig dataclass above.
+    # the local dbt process; see the FlightConfig dataclass above. Deliberately
+    # absent from _connection_keys(), which dbt logs: access_token_name names a
+    # MotherDuck token and does not belong in the output.
     flights: Optional[FlightConfig] = None
 
     # An optional flag to indicate whether the database is a ducklake database,
@@ -455,5 +455,4 @@ class DuckDBCredentials(Credentials):
             "remote",
             "plugins",
             "disable_transactions",
-            "flights",
         )

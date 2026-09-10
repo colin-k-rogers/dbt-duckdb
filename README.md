@@ -847,13 +847,28 @@ default:
         max_runtime_sec: 1800       # per-run timeout enforced by MotherDuck
         timeout_sec: 3600           # how long dbt waits for the run to finish
         poll_interval_sec: 2.0
+        log_lines: 0                # lines of a failed run's log to inline in the dbt error
         requirements:               # added to every model's own `packages`
           - pandas==2.2.3
 ```
 
-dbt keeps one Flight per model, named after the model's project, database, schema, and identifier, and updates it only
-when the model's code or requirements actually change — so each model gets its own run and version history in the
-MotherDuck UI. If a run fails, the tail of its log is attached to the dbt error.
+dbt keeps one Flight per model and updates it only when the model's code or requirements actually change — so each
+model gets its own run and version history in the MotherDuck UI. A failing run raises with the Flight name, run number
+and exit code, plus how to read that run's logs; set `log_lines` to inline that many lines of the log instead, and
+`log_url_template` (e.g. `https://.../{flight_id}/{run_number}`) to point at your MotherDuck UI.
+
+**Flight names come from a macro you can override.** The default is the model's project, database, schema and
+identifier. Flight names are unique per MotherDuck user, so if two dbt targets share a database and schema — or you
+want your own naming scheme — override `duckdb__flight_name` in your project:
+
+```sql
+{% macro duckdb__flight_name(parsed_model) -%}
+  {{ return('acme-' ~ target.name ~ '-' ~ parsed_model.get('alias')) }}
+{%- endmacro %}
+```
+
+Note that Flights belong to the MotherDuck user who created them, and only that user can run one. Two people running
+the same project each get their own Flight, and neither can reuse the other's.
 
 Three things are worth knowing before you turn this on:
 
