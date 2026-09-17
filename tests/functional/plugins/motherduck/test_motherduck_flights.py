@@ -1,5 +1,4 @@
 """End-to-end tests for submitting Python models to MotherDuck Flights.
-
 These run real Flights, which cost MotherDuck compute and take ~10s each, and
 require an account with Flights enabled. They are opt-in: set
 DBT_DUCKDB_TEST_FLIGHTS=1 to run them (`tox -e md-flights`).

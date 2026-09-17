@@ -1,13 +1,10 @@
 """Run dbt Python models on MotherDuck Flights instead of in the dbt process.
-
 A Flight is a single-file Python program that MotherDuck runs in its own
-container. dbt-core's compiled Python model only needs a DuckDB connection and
-a function mapping a relation name to a DataFrame, so the Flight source is that
-compiled code plus a generated main() supplying both.
-
-The lifecycle is expressed as MD_*_FLIGHT SQL functions, callable on any
-MotherDuck connection -- including one in SaaS mode, which is what lets Python
-models run there at all.
+container. dbt-core's compiled Python model only needs a DuckDB connection and a
+function mapping a relation name to a DataFrame, so the Flight source is that
+compiled code plus a generated main() supplying both. The lifecycle is expressed
+as MD_*_FLIGHT SQL functions, callable on any MotherDuck connection -- including
+one in SaaS mode, which is what lets Python models run there at all.
 """
 
 import re
@@ -84,7 +81,6 @@ if __name__ == "__main__":
 
 def _distribution_name(requirement: str) -> Optional[str]:
     """The distribution a requirements.txt line pins, normalized per PEP 503.
-
     None for pip options and anything else not attributable to a distribution.
     """
     match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:\[|[=<>!~;@]|$)", requirement)
@@ -122,15 +118,13 @@ def build_source(compiled_code: str, settings: Optional[Dict[str, Any]] = None) 
 
 def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> str:
     """Assemble requirements.txt for the Flight.
-
     A Flight installs dependencies before main() runs and cannot install more
     later, so dbt's `packages` model config -- inert locally -- is load-bearing
     here. Later sources win per distribution, so `packages` beats
     `flights.requirements` beats the default duckdb pin; two pins for one
-    distribution would just fail the install.
-
-    duckdb defaults to the local client's version, which MotherDuck accepts;
-    an unpinned install can pick up a release it rejects at connect time.
+    distribution would just fail the install. duckdb defaults to the local
+    client's version, which MotherDuck accepts; an unpinned install can pick up
+    a release it rejects at connect time.
     """
     packages: List[str] = [f"duckdb=={config.duckdb_version or duckdb.__version__}"]
     packages.extend(config.requirements or [])
@@ -160,7 +154,6 @@ def build_requirements(parsed_model: Dict[str, Any], config: FlightConfig) -> st
 
 class FlightRunner:
     """Drives the Flight lifecycle for Python model submission.
-
     One Flight per model node, so each keeps its own run and version history in
     the MotherDuck UI.
     """
@@ -208,7 +201,6 @@ class FlightRunner:
 
     def _upsert_flight(self, cursor, name: str, source: str, requirements: str) -> str:
         """Create the Flight, or update it when its code changed.
-
         Every content change mints a new immutable version, so check first
         rather than versioning on every dbt run.
         """
@@ -272,7 +264,6 @@ class FlightRunner:
 
     def _find_flight(self, cursor, name: str) -> Optional[str]:
         """Resolve a Flight id by name, among the Flights we own.
-
         Only the owner can run a Flight, so another user's is of no use to us.
         """
         if name in self._flight_ids:
@@ -363,7 +354,6 @@ class FlightRunner:
 
     def _log_pointer(self, cursor, flight_id: str, run_number: int) -> str:
         """Where to read the run's logs, plus a tail if `log_lines` asks for one.
-
         A Flight log includes the whole dependency install, so it is not dumped
         into dbt's output by default.
         """
@@ -393,7 +383,6 @@ class FlightRunner:
 
     def _execute(self, cursor, sql: str):
         """Run a statement, keeping the access token label out of any error.
-
         DuckDB errors can echo the statement, and these carry that label.
         """
         try:

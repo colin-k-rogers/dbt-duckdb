@@ -1,9 +1,8 @@
 {#
-  Name of the MotherDuck Flight that runs a Python model.
-
-  Flight names are unique per MotherDuck user, so override `duckdb__flight_name`
-  in your own project when the default would collide -- e.g. two dbt targets
-  sharing a database and schema.
+  Name of the MotherDuck Flight that runs a Python model. Flight names are
+  unique per MotherDuck user, so override `duckdb__flight_name` in your own
+  project when the default would collide -- e.g. two dbt targets sharing a
+  database and schema.
 #}
 
 {% macro flight_name(parsed_model) -%}

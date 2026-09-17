@@ -66,7 +66,6 @@ class MotherDuckEnvironment(LocalEnvironment):
 
     def flight_databases(self) -> Set[str]:
         """Database names that resolve both locally and inside a Flight.
-
         A Flight's fresh `md:` handle only knows MotherDuck databases, under
         their real names -- so an aliased attachment is unusable remotely even
         though it points at MotherDuck.
@@ -82,7 +81,6 @@ class MotherDuckEnvironment(LocalEnvironment):
 
     def validate_flight_target(self, parsed_model: Dict[str, Any]) -> None:
         """Reject models a Flight could not build, before paying for a run.
-
         This environment is also used when MotherDuck is merely attached to a
         local database, where a model can target a dbt-process-only catalog.
         """

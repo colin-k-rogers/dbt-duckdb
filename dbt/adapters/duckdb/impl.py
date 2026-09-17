@@ -349,7 +349,6 @@ class DuckDBAdapter(SQLAdapter):
 
     def _resolve_flight_name(self, env, parsed_model: dict) -> dict:
         """Name the MotherDuck Flight for a model, via the overridable macro.
-
         Macros are only resolvable here, on the adapter, so the name rides along
         in the model dict rather than through the Environment interface.
         """

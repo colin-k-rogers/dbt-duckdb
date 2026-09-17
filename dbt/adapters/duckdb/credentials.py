@@ -164,7 +164,6 @@ class Extension(dbtClassMixin):
 @dataclass
 class FlightConfig(dbtClassMixin):
     """Settings for running Python models on MotherDuck Flights.
-
     Only consulted for models submitted with `submission_method: flight`.
     """
 
