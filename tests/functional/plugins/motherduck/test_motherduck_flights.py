@@ -66,7 +66,8 @@ class TestMotherDuckFlightPythonModel(FlightTestBase):
 
         # The Flight wrote the table from its own session; this assertion also
         # covers the cross-session visibility the incremental path depends on.
-        rows = project.run_sql("select grp, n from flight_model order by grp", fetch="all")
+        model = f"{project.database}.{project.test_schema}.flight_model"
+        rows = project.run_sql(f"select grp, n from {model} order by grp", fetch="all")
         assert [(row[0], row[1]) for row in rows] == [(0, 33), (1, 34), (2, 33)]
 
     def test_rerun_reuses_the_flight(self, project):
@@ -89,7 +90,8 @@ class TestMotherDuckFlightPythonModel(FlightTestBase):
         (after,) = project.run_sql(version_sql, fetch="one")
 
         assert after == before
-        (count,) = project.run_sql("select count(*) from flight_model", fetch="one")
+        model = f"{project.database}.{project.test_schema}.flight_model"
+        (count,) = project.run_sql(f"select count(*) from {model}", fetch="one")
         assert count == 3
 
 
@@ -174,16 +176,16 @@ class TestMotherDuckFlightIncremental(FlightTestBase):
         }
 
     def test_incremental_rerun_is_idempotent(self, project):
+        model = f"{project.database}.{project.test_schema}.incremental_flight_model"
+
         run_dbt(["run"])
-        (first,) = project.run_sql("select count(*) from incremental_flight_model", fetch="one")
+        (first,) = project.run_sql(f"select count(*) from {model}", fetch="one")
         assert first == 100
 
         # The second run re-inserts ids 51-100; delete+insert on the unique key
         # must replace them rather than duplicate them.
         run_dbt(["run"])
-        (second,) = project.run_sql("select count(*) from incremental_flight_model", fetch="one")
-        (distinct,) = project.run_sql(
-            "select count(distinct id) from incremental_flight_model", fetch="one"
-        )
+        (second,) = project.run_sql(f"select count(*) from {model}", fetch="one")
+        (distinct,) = project.run_sql(f"select count(distinct id) from {model}", fetch="one")
         assert second == 100
         assert distinct == 100
