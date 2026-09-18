@@ -26,6 +26,7 @@ class FlightTestBase:
         except Exception as err:
             pytest.skip(f"MotherDuck Flights are not available on this account: {err}")
 
+
 upstream_sql = """
 {{ config(materialized='table') }}
 select i as id, i % 3 as grp from generate_series(1, 100) g(i)
@@ -133,3 +134,56 @@ class TestMotherDuckFlightsEnabledByDefault(FlightTestBase):
         (opted_out_rows,) = project.run_sql("select count(*) from opted_out_model", fetch="one")
         assert default_rows == 3
         assert opted_out_rows == 100
+
+
+incremental_python_model = """
+import pandas as pd
+
+def model(dbt, session):
+    dbt.config(
+        materialized="incremental",
+        unique_key="id",
+        submission_method="flight",
+        packages=["pandas==2.2.3"],
+    )
+    df = dbt.ref("upstream_model").df()
+    if dbt.is_incremental:
+        # Only the tail on a re-run; delete+insert should replace those rows
+        df = df[df["id"] > 50]
+    return df
+"""
+
+
+@pytest.mark.skip_profile("buenavista", "file", "memory")
+class TestMotherDuckFlightIncremental(FlightTestBase):
+    """An incremental model hands its temp relation between two sessions.
+    The Flight writes the temp relation from MotherDuck's container and the dbt
+    session merges it, so this covers the cross-session handoff that a re-run
+    depends on.
+    """
+
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {"models": {"+incremental_strategy": "delete+insert"}}
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "upstream_model.sql": upstream_sql,
+            "incremental_flight_model.py": incremental_python_model,
+        }
+
+    def test_incremental_rerun_is_idempotent(self, project):
+        run_dbt(["run"])
+        (first,) = project.run_sql("select count(*) from incremental_flight_model", fetch="one")
+        assert first == 100
+
+        # The second run re-inserts ids 51-100; delete+insert on the unique key
+        # must replace them rather than duplicate them.
+        run_dbt(["run"])
+        (second,) = project.run_sql("select count(*) from incremental_flight_model", fetch="one")
+        (distinct,) = project.run_sql(
+            "select count(distinct id) from incremental_flight_model", fetch="one"
+        )
+        assert second == 100
+        assert distinct == 100
